@@ -38,8 +38,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         <p>
           This sample demonstrates use of an 'inline' XRSession to present
           content on the page prior to entering XR presentation with an
-          immersive session. The viewer pose can be adjusted by clicking and
-          dragging with mouse or touch.
+          immersive VR or AR session using the separate buttons below. Both
+          modes use the same scene; AR leaves the background transparent so
+          the real world can show through. The inline viewer pose can be
+          adjusted by clicking and dragging with mouse or touch.
           <a class="back" href="./">Back</a>
           <p>
             <input id='vertFOV' value='90' min='30' max='150' step='10' type='range'/><br/>
@@ -97,6 +99,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
       // XR globals.
       let xrButton = null;
+      let xrARButton = null;
+      let immersiveSession = null;
+      let sessionRequestPending = false;
+      let vrSupported = false;
+      let arSupported = false;
       let xrImmersiveRefSpace = null;
       let xrInlineRefSpace = null;
 
@@ -106,38 +113,90 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       let scene = new Scene();
       let solarSystem = new Gltf2Node({url: 'media/gltf/space/space.gltf'});
       scene.addNode(solarSystem);
-      scene.addNode(new SkyboxNode({url: 'media/textures/milky-way-4k.png'}));
+      let skybox = new SkyboxNode({url: 'media/textures/milky-way-4k.png'});
+      scene.addNode(skybox);
 
       function initXR() {
         xrButton = new WebXRButton({
           onRequestSession: onRequestSession,
-          onEndSession: onEndSession
+          onEndSession: onEndSession,
+          textEnterXRTitle: 'START VR'
+        });
+        xrARButton = new WebXRButton({
+          onRequestSession: onRequestARSession,
+          onEndSession: onEndSession,
+          textEnterXRTitle: 'START AR',
+          textXRNotFoundTitle: 'AR NOT FOUND',
+          textExitXRTitle: 'EXIT AR'
         });
         document.querySelector('header').appendChild(xrButton.domElement);
+        document.querySelector('header').appendChild(xrARButton.domElement);
 
         if (navigator.xr) {
           navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
-            xrButton.enabled = supported;
-          });
+            vrSupported = supported;
+            updateXRButtons();
+          }).catch((error) => console.warn('VR support check failed:', error));
+          navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+            arSupported = supported;
+            updateXRButtons();
+          }).catch((error) => console.warn('AR support check failed:', error));
 
           // Start up an inline session, which should always be supported on
           // browsers that support WebXR regardless of the available hardware.
           navigator.xr.requestSession('inline').then((session) => {
             inlineSession = session;
-            onSessionStarted(session);
-            updateFov();
-          });
+            return onSessionStarted(session).then(updateFov);
+          }).catch((error) => console.error('Inline session failed:', error));
+        }
+      }
+
+      function updateXRButtons() {
+        for (let [button, supported] of [[xrButton, vrSupported], [xrARButton, arSupported]]) {
+          // Clear the helper's forced lock before refreshing its enabled state.
+          button.enable();
+          button.enabled = supported;
+          // Only one immersive session can run at a time. Keep its exit usable.
+          if (!supported || sessionRequestPending ||
+              (immersiveSession && button.session !== immersiveSession)) {
+            button.disable();
+          }
         }
       }
 
       function onRequestSession() {
-        return navigator.xr.requestSession('immersive-vr').then((session) => {
-          xrButton.setSession(session);
-          // Set a flag on the session so we can differentiate it from the
-          // inline session.
+        return requestImmersiveSession('immersive-vr', xrButton);
+      }
+
+      function onRequestARSession() {
+        return requestImmersiveSession('immersive-ar', xrARButton);
+      }
+
+      async function requestImmersiveSession(mode, button) {
+        if (sessionRequestPending || immersiveSession) {
+          return;
+        }
+        sessionRequestPending = true;
+        updateXRButtons();
+        let session = null;
+        try {
+          // Request immediately in the button callback, preserving user activation.
+          session = await navigator.xr.requestSession(mode);
           session.isImmersive = true;
-          onSessionStarted(session);
-        });
+          session.isAR = mode === 'immersive-ar';
+          immersiveSession = session;
+          button.setSession(session);
+          await onSessionStarted(session);
+        } catch (error) {
+          // Release a session if render-layer or reference-space setup fails.
+          if (session) {
+            await session.end();
+          }
+          throw error;
+        } finally {
+          sessionRequestPending = false;
+          updateXRButtons();
+        }
       }
 
       function onSessionStarted(session) {
@@ -145,7 +204,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
         if (!gl) {
           gl = createWebGLContext({
-            xrCompatible: true
+            xrCompatible: true,
+            alpha: true
           });
 
           // In order for an inline session to be used we must attach the WebGL
@@ -183,11 +243,19 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         });
 
         let refSpaceType = session.isImmersive ? 'local' : 'viewer';
-        session.requestReferenceSpace(refSpaceType).then((refSpace) => {
+        return session.requestReferenceSpace(refSpaceType).then((refSpace) => {
           // Since we're dealing with multiple sessions now we need to track
           // which XRReferenceSpace is associated with which XRSession.
           if (session.isImmersive) {
             xrImmersiveRefSpace = refSpace;
+            if (session.isAR) {
+              // Compensate for known origin shifts to keep AR content grounded.
+              refSpace.addEventListener('reset', (event) => {
+                if (event.transform && immersiveSession === session) {
+                  xrImmersiveRefSpace = xrImmersiveRefSpace.getOffsetReferenceSpace(event.transform);
+                }
+              });
+            }
           } else {
             xrInlineRefSpace = refSpace;
           }
@@ -196,13 +264,17 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       }
 
       function onEndSession(session) {
-        session.end();
+        return session.end().catch((error) => console.error('Could not end XR session:', error));
       }
 
       function onSessionEnded(event) {
-        // Only reset the button when the immersive session ends.
-        if (event.session.isImmersive) {
+        if (event.session === immersiveSession) {
           xrButton.setSession(null);
+          xrARButton.setSession(null);
+          immersiveSession = null;
+          xrImmersiveRefSpace = null;
+          skybox.visible = true;
+          updateXRButtons();
         }
       }
 
@@ -229,6 +301,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         if (pose) {
           let glLayer = session.renderState.baseLayer;
           gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
+          // Choose the background per frame, since inline and immersive share it.
+          skybox.visible = !session.isAR;
+          gl.clearColor(0, 0, 0, 0);
           gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
           for (let view of pose.views) {
