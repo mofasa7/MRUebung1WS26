@@ -250,7 +250,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             xrImmersiveRefSpace = refSpace;
             if (session.isAR) {
               // Compensate for known origin shifts to keep AR content grounded.
-              refSpace.addEventListener('reset', (event) => {
+              refSpace.addEventListener?.('reset', (event) => {
                 if (event.transform && immersiveSession === session) {
                   xrImmersiveRefSpace = xrImmersiveRefSpace.getOffsetReferenceSpace(event.transform);
                 }
